@@ -1048,7 +1048,8 @@ static int lxcDomainCreateWithFiles(virDomainPtr dom,
     int ret = -1;
     virLXCDriverConfigPtr cfg = virLXCDriverGetConfig(driver);
 
-    virCheckFlags(VIR_DOMAIN_START_AUTODESTROY, -1);
+    virCheckFlags(VIR_DOMAIN_START_AUTODESTROY &
+                  VIR_DOMAIN_START_PAUSED, -1);
 
     virNWFilterReadLockFilterUpdates();
 
@@ -1070,15 +1071,29 @@ static int lxcDomainCreateWithFiles(virDomainPtr dom,
         goto cleanup;
     }
 
+    if ((flags & VIR_DOMAIN_START_PAUSED) && lxcFreezeContainer(vm) < 0) {
+        if (lxcFreezeContainer(vm) < 0) {
+            virReportError(VIR_ERR_OPERATION_FAILED,
+                           "%s", _("Suspend operation failed"));
+            goto cleanup;
+        }
+    }
+
     ret = virLXCProcessStart(dom->conn, driver, vm,
                              nfiles, files,
                              (flags & VIR_DOMAIN_START_AUTODESTROY),
                              VIR_DOMAIN_RUNNING_BOOTED);
 
-    if (ret == 0) {
+    if (ret == 0 && !(flags & VIR_DOMAIN_START_PAUSED)) {
         event = virDomainEventLifecycleNewFromObj(vm,
                                          VIR_DOMAIN_EVENT_STARTED,
                                          VIR_DOMAIN_EVENT_STARTED_BOOTED);
+        virDomainAuditStart(vm, "booted", true);
+    } else if (ret == 0 && (flags & VIR_DOMAIN_START_PAUSED)) {
+        virDomainObjSetState(vm, VIR_DOMAIN_PAUSED, VIR_DOMAIN_PAUSED_USER);
+        event = virDomainEventLifecycleNewFromObj(vm,
+                                         VIR_DOMAIN_EVENT_SUSPENDED,
+                                         VIR_DOMAIN_EVENT_SUSPENDED_PAUSED);
         virDomainAuditStart(vm, "booted", true);
     } else {
         virDomainAuditStart(vm, "booted", false);
