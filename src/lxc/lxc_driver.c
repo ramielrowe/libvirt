@@ -1020,6 +1020,92 @@ cleanup:
     return xml;
 }
 
+static int lxcFreezeContainer(virDomainObjPtr vm)
+{
+    int timeout = 1000; /* In milliseconds */
+    int check_interval = 1; /* In milliseconds */
+    int exp = 10;
+    int waited_time = 0;
+    int ret = -1;
+    char *state = NULL;
+    virLXCDomainObjPrivatePtr priv = vm->privateData;
+
+    while (waited_time < timeout) {
+        int r;
+        /*
+         * Writing "FROZEN" to the "freezer.state" freezes the group,
+         * i.e., the container, temporarily transiting "FREEZING" state.
+         * Once the freezing is completed, the state of the group transits
+         * to "FROZEN".
+         * (see linux-2.6/Documentation/cgroups/freezer-subsystem.txt)
+         */
+        r = virCgroupSetFreezerState(priv->cgroup, "FROZEN");
+
+        /*
+         * Returning EBUSY explicitly indicates that the group is
+         * being freezed but incomplete and other errors are true
+         * errors.
+         */
+        if (r < 0 && r != -EBUSY) {
+            VIR_DEBUG("Writing freezer.state failed with errno: %d", r);
+            goto error;
+        }
+        if (r == -EBUSY)
+            VIR_DEBUG("Writing freezer.state gets EBUSY");
+
+        /*
+         * Unfortunately, returning 0 (success) is likely to happen
+         * even when the freezing has not been completed. Sometimes
+         * the state of the group remains "FREEZING" like when
+         * returning -EBUSY and even worse may never transit to
+         * "FROZEN" even if writing "FROZEN" again.
+         *
+         * So we don't trust the return value anyway and always
+         * decide that the freezing has been complete only with
+         * the state actually transit to "FROZEN".
+         */
+        usleep(check_interval * 1000);
+
+        r = virCgroupGetFreezerState(priv->cgroup, &state);
+
+        if (r < 0) {
+            VIR_DEBUG("Reading freezer.state failed with errno: %d", r);
+            goto error;
+        }
+        VIR_DEBUG("Read freezer.state: %s", state);
+
+        if (STREQ(state, "FROZEN")) {
+            ret = 0;
+            goto cleanup;
+        }
+
+        waited_time += check_interval;
+        /*
+         * Increasing check_interval exponentially starting with
+         * small initial value treats nicely two cases; One is
+         * a container is under no load and waiting for long period
+         * makes no sense. The other is under heavy load. The container
+         * may stay longer time in FREEZING or never transit to FROZEN.
+         * In that case, eager polling will just waste CPU time.
+         */
+        check_interval *= exp;
+        VIR_FREE(state);
+    }
+    VIR_DEBUG("lxcFreezeContainer timeout");
+error:
+    /*
+     * If timeout or an error on reading the state occurs,
+     * activate the group again and return an error.
+     * This is likely to fall the group back again gracefully.
+     */
+    virCgroupSetFreezerState(priv->cgroup, "THAWED");
+    ret = -1;
+
+cleanup:
+    VIR_FREE(state);
+    return ret;
+}
+
 /**
  * lxcDomainCreateWithFiles:
  * @dom: domain to start
@@ -1040,7 +1126,8 @@ static int lxcDomainCreateWithFiles(virDomainPtr dom,
     int ret = -1;
     virLXCDriverConfigPtr cfg = virLXCDriverGetConfig(driver);
 
-    virCheckFlags(VIR_DOMAIN_START_AUTODESTROY, -1);
+    virCheckFlags(VIR_DOMAIN_START_AUTODESTROY |
+                  VIR_DOMAIN_START_PAUSED, -1);
 
     virNWFilterReadLockFilterUpdates();
 
@@ -1065,12 +1152,19 @@ static int lxcDomainCreateWithFiles(virDomainPtr dom,
     ret = virLXCProcessStart(dom->conn, driver, vm,
                              nfiles, files,
                              (flags & VIR_DOMAIN_START_AUTODESTROY),
+                             (flags & VIR_DOMAIN_START_PAUSED),
                              VIR_DOMAIN_RUNNING_BOOTED);
 
-    if (ret == 0) {
+    if (ret == 0 && !(flags & VIR_DOMAIN_START_PAUSED)) {
         event = virDomainEventLifecycleNewFromObj(vm,
                                          VIR_DOMAIN_EVENT_STARTED,
                                          VIR_DOMAIN_EVENT_STARTED_BOOTED);
+        virDomainAuditStart(vm, "booted", true);
+    } else if (ret == 0 && (flags & VIR_DOMAIN_START_PAUSED)) {
+        virDomainObjSetState(vm, VIR_DOMAIN_PAUSED, VIR_DOMAIN_PAUSED_USER);
+        event = virDomainEventLifecycleNewFromObj(vm,
+                                         VIR_DOMAIN_EVENT_SUSPENDED,
+                                         VIR_DOMAIN_EVENT_SUSPENDED_PAUSED);
         virDomainAuditStart(vm, "booted", true);
     } else {
         virDomainAuditStart(vm, "booted", false);
@@ -1172,6 +1266,7 @@ lxcDomainCreateXMLWithFiles(virConnectPtr conn,
     if (virLXCProcessStart(conn, driver, vm,
                            nfiles, files,
                            (flags & VIR_DOMAIN_START_AUTODESTROY),
+                           false,
                            VIR_DOMAIN_RUNNING_BOOTED) < 0) {
         virDomainAuditStart(vm, "booted", false);
         virDomainObjListRemove(driver->domains, vm);
@@ -3188,92 +3283,6 @@ cleanup:
     if (vm)
         virObjectUnlock(vm);
     virObjectUnref(cfg);
-    return ret;
-}
-
-static int lxcFreezeContainer(virDomainObjPtr vm)
-{
-    int timeout = 1000; /* In milliseconds */
-    int check_interval = 1; /* In milliseconds */
-    int exp = 10;
-    int waited_time = 0;
-    int ret = -1;
-    char *state = NULL;
-    virLXCDomainObjPrivatePtr priv = vm->privateData;
-
-    while (waited_time < timeout) {
-        int r;
-        /*
-         * Writing "FROZEN" to the "freezer.state" freezes the group,
-         * i.e., the container, temporarily transiting "FREEZING" state.
-         * Once the freezing is completed, the state of the group transits
-         * to "FROZEN".
-         * (see linux-2.6/Documentation/cgroups/freezer-subsystem.txt)
-         */
-        r = virCgroupSetFreezerState(priv->cgroup, "FROZEN");
-
-        /*
-         * Returning EBUSY explicitly indicates that the group is
-         * being freezed but incomplete and other errors are true
-         * errors.
-         */
-        if (r < 0 && r != -EBUSY) {
-            VIR_DEBUG("Writing freezer.state failed with errno: %d", r);
-            goto error;
-        }
-        if (r == -EBUSY)
-            VIR_DEBUG("Writing freezer.state gets EBUSY");
-
-        /*
-         * Unfortunately, returning 0 (success) is likely to happen
-         * even when the freezing has not been completed. Sometimes
-         * the state of the group remains "FREEZING" like when
-         * returning -EBUSY and even worse may never transit to
-         * "FROZEN" even if writing "FROZEN" again.
-         *
-         * So we don't trust the return value anyway and always
-         * decide that the freezing has been complete only with
-         * the state actually transit to "FROZEN".
-         */
-        usleep(check_interval * 1000);
-
-        r = virCgroupGetFreezerState(priv->cgroup, &state);
-
-        if (r < 0) {
-            VIR_DEBUG("Reading freezer.state failed with errno: %d", r);
-            goto error;
-        }
-        VIR_DEBUG("Read freezer.state: %s", state);
-
-        if (STREQ(state, "FROZEN")) {
-            ret = 0;
-            goto cleanup;
-        }
-
-        waited_time += check_interval;
-        /*
-         * Increasing check_interval exponentially starting with
-         * small initial value treats nicely two cases; One is
-         * a container is under no load and waiting for long period
-         * makes no sense. The other is under heavy load. The container
-         * may stay longer time in FREEZING or never transit to FROZEN.
-         * In that case, eager polling will just waste CPU time.
-         */
-        check_interval *= exp;
-        VIR_FREE(state);
-    }
-    VIR_DEBUG("lxcFreezeContainer timeout");
-error:
-    /*
-     * If timeout or an error on reading the state occurs,
-     * activate the group again and return an error.
-     * This is likely to fall the group back again gracefully.
-     */
-    virCgroupSetFreezerState(priv->cgroup, "THAWED");
-    ret = -1;
-
-cleanup:
-    VIR_FREE(state);
     return ret;
 }
 
